@@ -4,6 +4,7 @@ import mongoose, { Schema, Document, Model } from "mongoose";
 export interface IPlayer extends Document {
   username: string;
   score: number;
+  highScore: number;
   createdAt: Date;
 }
 
@@ -11,6 +12,7 @@ const PlayerSchema = new Schema<IPlayer>(
   {
     username: { type: String, required: true, unique: true },
     score: { type: Number, default: 0 },
+    highScore: { type: Number, default: 0 },
   },
   { timestamps: true }
 );

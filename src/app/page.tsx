@@ -2,10 +2,39 @@
 
 import { useState, useEffect, useCallback, useRef } from "react";
 
+/* ═══════════════════════════════════════════════════════
+   NETWORK UTILITIES — retry with exponential backoff
+   ═══════════════════════════════════════════════════════ */
+async function fetchWithRetry(
+  url: string,
+  options?: RequestInit,
+  maxRetries = 3,
+  baseDelay = 500
+): Promise<Response> {
+  let lastError: Error | null = null;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 8000); // 8s timeout per attempt
+      const res = await fetch(url, { ...options, signal: controller.signal });
+      clearTimeout(timeout);
+      return res;
+    } catch (err) {
+      lastError = err as Error;
+      if (attempt < maxRetries) {
+        // Exponential backoff: 500ms, 1000ms, 2000ms
+        await new Promise((r) => setTimeout(r, baseDelay * Math.pow(2, attempt)));
+      }
+    }
+  }
+  throw lastError;
+}
+
 interface LeaderboardEntry {
   _id: string;
   username: string;
   score: number;
+  highScore: number;
 }
 
 interface QuestionData {
@@ -34,7 +63,28 @@ export default function Home() {
   const [submitting, setSubmitting] = useState(false);
   const [timeLeft, setTimeLeft] = useState(60);
 
+  // ── Network health state ──
+  const [connectionStatus, setConnectionStatus] = useState<"connected" | "reconnecting" | "offline">("connected");
+  const consecutiveFailures = useRef(0);
+  const pollIntervalRef = useRef(1500); // adaptive polling interval in ms
+
   const lastQuestionId = useRef<string | null>(null);
+
+  // ── Detect browser online/offline events ──
+  useEffect(() => {
+    const goOffline = () => setConnectionStatus("offline");
+    const goOnline = () => {
+      setConnectionStatus("connected");
+      consecutiveFailures.current = 0;
+      pollIntervalRef.current = 1500;
+    };
+    window.addEventListener("offline", goOffline);
+    window.addEventListener("online", goOnline);
+    return () => {
+      window.removeEventListener("offline", goOffline);
+      window.removeEventListener("online", goOnline);
+    };
+  }, []);
 
   // ── Restore session from sessionStorage ──
   useEffect(() => {
@@ -52,7 +102,7 @@ export default function Home() {
     setJoining(true);
     setJoinError("");
     try {
-      const res = await fetch("/api/join", {
+      const res = await fetchWithRetry("/api/join", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ username: username.trim() }),
@@ -73,14 +123,21 @@ export default function Home() {
     }
   };
 
-  // ── Poll for question updates ──
+  // ── Poll for question updates (with adaptive interval) ──
   const fetchQuestion = useCallback(async () => {
     try {
-      const res = await fetch("/api/question");
+      const res = await fetchWithRetry("/api/question", undefined, 1, 300); // 1 retry for polling (fast)
       if (!res.ok) return;
       const data: QuestionData = await res.json();
       setQuestion(data);
       setTimeLeft(Math.ceil(data.remainingMs / 1000));
+
+      // Network recovered — reset to fast polling
+      if (consecutiveFailures.current > 0) {
+        consecutiveFailures.current = 0;
+        pollIntervalRef.current = 1500;
+        setConnectionStatus("connected");
+      }
 
       // If question changed, clear input and feedback
       if (data.questionId !== lastQuestionId.current) {
@@ -91,15 +148,31 @@ export default function Home() {
         }
       }
     } catch {
-      // Silently retry on next poll
+      // Adaptive backoff: slow down polling on consecutive failures
+      consecutiveFailures.current += 1;
+      if (consecutiveFailures.current >= 5) {
+        setConnectionStatus("offline");
+        pollIntervalRef.current = 10000; // 10s when offline
+      } else if (consecutiveFailures.current >= 2) {
+        setConnectionStatus("reconnecting");
+        pollIntervalRef.current = 4000; // 4s when struggling
+      }
     }
   }, []);
 
   useEffect(() => {
     if (!playerId) return;
     fetchQuestion();
-    const interval = setInterval(fetchQuestion, 1500);
-    return () => clearInterval(interval);
+    // Use dynamic interval via recursive setTimeout
+    let timeoutId: ReturnType<typeof setTimeout>;
+    const schedulePoll = () => {
+      timeoutId = setTimeout(async () => {
+        await fetchQuestion();
+        schedulePoll();
+      }, pollIntervalRef.current);
+    };
+    schedulePoll();
+    return () => clearTimeout(timeoutId);
   }, [playerId, fetchQuestion]);
 
   // ── Count down timer locally ──
@@ -120,15 +193,16 @@ export default function Home() {
     setFeedback(null);
 
     try {
-      const res = await fetch("/api/answer", {
+      const res = await fetchWithRetry("/api/answer", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           playerId,
           questionId: question.questionId,
           answer: Number(answerInput),
+          submittedAt: Date.now(), // timestamp for network latency fairness
         }),
-      });
+      }, 2, 300); // 2 retries, 300ms base delay for answers
       const data = await res.json();
 
       if (data.won) {
@@ -231,6 +305,22 @@ export default function Home() {
       </div>
 
       <div className="max-w-5xl mx-auto grid grid-cols-1 lg:grid-cols-3 gap-6">
+        {/* ── Connection Status Banner ── */}
+        {connectionStatus !== "connected" && (
+          <div className="lg:col-span-3">
+            <div
+              className={`rounded-xl p-3 text-center text-sm font-medium ${
+                connectionStatus === "offline"
+                  ? "bg-red-500/20 text-red-100 border border-red-400/30"
+                  : "bg-yellow-500/20 text-yellow-100 border border-yellow-400/30"
+              }`}
+            >
+              {connectionStatus === "offline"
+                ? "⚠ Connection lost — retrying every 10s..."
+                : "⏳ Slow connection — reconnecting..."}
+            </div>
+          </div>
+        )}
         {/* ── Main Question Panel ── */}
         <div className="lg:col-span-2 space-y-4">
           {/* Timer */}
@@ -358,7 +448,12 @@ export default function Home() {
                       )}
                     </span>
                   </div>
-                  <span className="font-bold text-gray-800">{entry.score}</span>
+                  <div className="text-right">
+                    <span className="font-bold text-gray-800">{entry.score}</span>
+                    <span className="block text-xs text-amber-600 font-medium">
+                      Best: {entry.highScore}
+                    </span>
+                  </div>
                 </div>
               ))}
             </div>

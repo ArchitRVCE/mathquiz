@@ -61,8 +61,18 @@ export async function POST(req: Request) {
       return NextResponse.json({ correct: true, won: false, message: "Correct, but someone was faster!" });
     }
 
-    // Increment the player's score
-    await Player.findByIdAndUpdate(playerId, { $inc: { score: 1 } });
+    // Increment the player's session score
+    const updatedPlayer = await Player.findByIdAndUpdate(
+      playerId,
+      { $inc: { score: 1 } },
+      { new: true }
+    );
+
+    // Update highScore if current session score exceeds it
+    if (updatedPlayer && updatedPlayer.score > updatedPlayer.highScore) {
+      updatedPlayer.highScore = updatedPlayer.score;
+      await updatedPlayer.save();
+    }
 
     // Deactivate this question and create the next one after a short delay
     // (the next question will be created when /api/question is polled and finds no active question)

@@ -38,11 +38,11 @@ export async function GET() {
       });
     }
 
-    // Get the leaderboard (top 10)
+    // Get the leaderboard (top 10 by current session score)
     const leaderboard = await Player.find({})
       .sort({ score: -1 })
       .limit(10)
-      .select("username score");
+      .select("username score highScore");
 
     const elapsed = Date.now() - new Date(question.createdAt).getTime();
     const remainingMs = Math.max(0, QUESTION_TIMEOUT_MS - elapsed);

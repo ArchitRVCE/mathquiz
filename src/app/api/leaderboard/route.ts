@@ -11,7 +11,7 @@ export async function GET() {
     const leaderboard = await Player.find({})
       .sort({ score: -1 })
       .limit(10)
-      .select("username score");
+      .select("username score highScore");
 
     return NextResponse.json({ leaderboard });
   } catch (error: unknown) {
